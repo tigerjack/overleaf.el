@@ -308,6 +308,11 @@ See `overleaf--edit-queue'.")
 (defvar overleaf--ws->buffer-table (make-hash-table :test #'eql)
   "A hash table associating web-sockets to buffers.")
 
+(defvar overleaf--project-root-folders (make-hash-table :test #'equal)
+  "A hash table mapping project ids to their root folder id.
+Populated from the `joinProjectResponse' message and used by
+`overleaf-create-file' to know where to create new documents.")
+
 (defvar overleaf--buffer nil
   "The current overleaf buffer (used in lexical binding).")
 
@@ -354,6 +359,9 @@ recent updates.  It has elements of the form `((from-version
      :help "Connect to overleaf"]
     ["Disconnect" overleaf-disconnect
      :help "Disconnect from overleaf"]
+    ["Create new file" overleaf-create-file
+     :help "Create a new document in the project and connect to it"
+     :active overleaf-project-id]
     ["Toggle auto save" overleaf-toggle-auto-save
      :help "Toggle auto-save on overleaf"]
     ["Toggle track changes" overleaf-toggle-track-changes
@@ -704,6 +712,13 @@ The context window size is configured using `overleaf-context-size'."
                      (plist-get
                       (car (plist-get message :args))
                       :publicId))
+         (when-let* ((pid overleaf-project-id)
+                     (root-id (plist-get
+                               (overleaf--pget
+                                (car (plist-get message :args))
+                                :project :rootFolder 0)
+                               :_id)))
+           (puthash pid root-id overleaf--project-root-folders))
          (unwind-protect
              (unless overleaf-document-id
                (let* ((root
@@ -1672,6 +1687,101 @@ Optionally prompt for the overleaf server URL."
     (setq-local overleaf-document-id nil)
     (overleaf-connect)))
 
+(defun overleaf--fetch-project-meta ()
+  "Fetch the Overleaf project page and extract metadata.
+
+Return a plist of the form (:csrf CSRF-TOKEN :root-folder-id ID).  Either
+value may be nil if it could not be located on the page.  Requires
+`overleaf-project-id' and the cookies to be set."
+  (let* ((cookies (overleaf--get-cookies))
+         (page (plz 'get (format "%s/project/%s" (overleaf--url) overleaf-project-id)
+                 :headers `(("Cookie" . ,cookies)
+                            ("Origin" . ,(overleaf--url))))))
+    (save-match-data
+      (list
+       :csrf
+       (cond
+        ((string-match "name=\"ol-csrfToken\"[^>]*?content=\"\\([^\"]+\\)\"" page)
+         (match-string 1 page))
+        ((string-match "content=\"\\([^\"]+\\)\"[^>]*?name=\"ol-csrfToken\"" page)
+         (match-string 1 page))
+        ((string-match "csrfToken[\"']?[[:space:]]*[:=][[:space:]]*[\"']\\([^\"']+\\)[\"']" page)
+         (match-string 1 page)))
+       :root-folder-id
+       (when (string-match "rootFolder[^_]*?_id[\"']?[[:space:]]*[:=][[:space:]]*[\"']\\([0-9a-f]\\{24\\}\\)" page)
+         (match-string 1 page))))))
+
+(defun overleaf--http-post-json (url cookies csrf body)
+  "POST BODY (a JSON string) to URL with COOKIES and the CSRF token.
+
+Return a cons cell (STATUS . RESPONSE-BODY).  STATUS is the HTTP status
+code, or nil if the request failed before a response was received (in
+which case RESPONSE-BODY holds the error message)."
+  (condition-case err
+      (let ((resp (plz 'post url
+                    :headers `(("Cookie" . ,cookies)
+                               ("Origin" . ,(overleaf--url))
+                               ("X-Csrf-Token" . ,csrf)
+                               ("Content-Type" . "application/json"))
+                    :body body
+                    :as 'response)))
+        (cons (plz-response-status resp) (plz-response-body resp)))
+    (plz-error
+     (let* ((pe (cl-find-if #'plz-error-p (cdr err)))
+            (resp (and pe (plz-error-response pe))))
+       (if resp
+           (cons (plz-response-status resp) (plz-response-body resp))
+         (cons nil (error-message-string err)))))))
+
+;;;###autoload
+(defun overleaf-create-file (name)
+  "Create a new document NAME in the current Overleaf project.
+
+The document is created on the Overleaf server (via the web API) and the
+current buffer is then connected to it (see `overleaf-connect').
+
+Requires `overleaf-cookies' to be set; `overleaf-url' and
+`overleaf-project-id' are prompted for if unset.  The project's root
+folder must be known, which is the case once any buffer has connected to
+the project during this session."
+  (interactive
+   (progn
+     (unless overleaf-cookies
+       (user-error "Variable `overleaf-cookies' is not set (see README)"))
+     (unless overleaf-url
+       (setq-local overleaf-url (read-string "Overleaf URL: " (overleaf--url))))
+     (unless overleaf-project-id
+       (setq-local overleaf-project-id (read-string "Project id: ")))
+     (list (read-string "New file name: "
+                        (and buffer-file-name
+                             (file-name-nondirectory buffer-file-name))))))
+  (let* ((meta (overleaf--fetch-project-meta))
+         (csrf (plist-get meta :csrf))
+         (parent (or (gethash overleaf-project-id overleaf--project-root-folders)
+                     (plist-get meta :root-folder-id))))
+    (unless csrf
+      (user-error "Could not read the CSRF token from %s/project/%s -- are the cookies valid?"
+                  (overleaf--url) overleaf-project-id))
+    (unless parent
+      (user-error "Unknown root folder for project %s -- connect to the project once (`overleaf-connect') and retry"
+                  overleaf-project-id))
+    (pcase-let* ((`(,status . ,resp-body)
+                  (overleaf--http-post-json
+                   (format "%s/project/%s/doc" (overleaf--url) overleaf-project-id)
+                   (overleaf--get-cookies) csrf
+                   (json-serialize `(:name ,name :parentFolderId ,parent))))
+                 (doc-id (and (stringp resp-body)
+                              (save-match-data
+                                (when (string-match "\"_id\"[[:space:]]*:[[:space:]]*\"\\([0-9a-f]\\{24\\}\\)\"" resp-body)
+                                  (match-string 1 resp-body))))))
+      (if (and status (<= 200 status 299) doc-id)
+          (progn
+            (setq-local overleaf-document-id doc-id)
+            (overleaf--message "Created \"%s\" (doc %s); connecting..." name doc-id)
+            (overleaf-connect))
+        (user-error "Creating \"%s\" failed (HTTP %s): %s"
+                    name status (or resp-body "no response"))))))
+
 ;;;###autoload
 (defun overleaf-connect ()
   "Connect current buffer to overleaf.
@@ -1858,6 +1968,7 @@ to the default tooltip text."
   "s" #'overleaf-toggle-auto-save
   "b" #'overleaf-browse-project
   "f" #'overleaf-find-file
+  "n" #'overleaf-create-file
   "g" #'overleaf-goto-cursor
   "l" #'overleaf-list-users)
 

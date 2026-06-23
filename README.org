@@ -110,6 +110,12 @@ with an overleaf connection before (i.e.
 the ~document-id~ and ~project-id~ aren't set), use ~M-x overleaf-find-file~
 to select a project and file.
 
+To create a *new* file in the project from Emacs, open (or create) a local
+file and call ~M-x overleaf-create-file~.  This creates the document on the
+Overleaf server and connects the current buffer to it.  The project's root
+folder must be known, which is the case once any buffer has connected to the
+project during the current Emacs session.
+
 The default overleaf instance can be customized by changing the ~overleaf-default-url~
 variable.
 
@@ -175,6 +181,7 @@ The available keybindings are then:
   - =[prefix] s= - toggle auto-save
   - =[prefix] b= - browse project
   - =[prefix] f= - find file
+  - =[prefix] n= - create a new file in the project
   - =[prefix] g= - go to the cursor of another user
   - =[prefix] l= - list users' cursor positions in an xref buffer
 
