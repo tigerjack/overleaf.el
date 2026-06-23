@@ -1026,6 +1026,20 @@ PADDING (2 characters by default)."
       (overleaf--flush-edit-queue (current-buffer))
       (setq-local overleaf-track-changes track-changes))))
 
+(defun overleaf--persist-when-connected (buffer &optional attempts)
+  "Persist Overleaf's buffer-local variables to BUFFER once it is connected.
+Polls until `overleaf--connected-p' (for up to ~10 seconds) and then
+writes the file-local variables via `overleaf--write-buffer-variables'.
+ATTEMPTS is the internal retry counter."
+  (let ((attempts (or attempts 0)))
+    (cond
+     ((not (buffer-live-p buffer)))
+     ((with-current-buffer buffer (overleaf--connected-p))
+      (with-current-buffer buffer (overleaf--write-buffer-variables)))
+     ((< attempts 40)
+      (run-with-timer 0.25 nil #'overleaf--persist-when-connected
+                      buffer (1+ attempts))))))
+
 (defun overleaf--save-buffer ()
   "Safely save the buffer."
   (let ((overleaf--is-overleaf-change t))
@@ -1778,7 +1792,8 @@ the project during this session."
           (progn
             (setq-local overleaf-document-id doc-id)
             (overleaf--message "Created \"%s\" (doc %s); connecting..." name doc-id)
-            (overleaf-connect))
+            (overleaf-connect)
+            (overleaf--persist-when-connected (current-buffer)))
         (user-error "Creating \"%s\" failed (HTTP %s): %s"
                     name status (or resp-body "no response"))))))
 
